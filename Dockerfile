@@ -16,19 +16,25 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION
 
 FROM alpine:3.22.0
 
-RUN apk add --no-cache tzdata
+RUN apk add --no-cache tzdata ca-certificates
 
-RUN mkdir /CLIProxyAPI
+RUN mkdir -p /CLIProxyAPI/panel
 
-COPY --from=builder ./app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
+COPY --from=builder /app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+
+# Management panel — built by CI from Cli-Proxy-API-Management-Center and
+# placed at panel/management.html before docker build context is sent.
+# If absent the server auto-downloads from GitHub on first start.
+COPY panel/ /CLIProxyAPI/panel/
 
 WORKDIR /CLIProxyAPI
 
 EXPOSE 8317
 
 ENV TZ=Asia/Shanghai
+ENV MANAGEMENT_STATIC_PATH=/CLIProxyAPI/panel/management.html
 
 RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
 

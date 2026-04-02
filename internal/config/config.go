@@ -112,6 +112,17 @@ type Config struct {
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
+	// APIKeyConfigs defines per-API-key model restrictions and routing overrides.
+	// Keys listed here are automatically merged into the flat api-keys list so that
+	// MakeInlineAPIKeyProvider picks them up without requiring duplicate entries.
+	APIKeyConfigs []APIKeyConfig `yaml:"api-key-configs,omitempty" json:"api-key-configs,omitempty"`
+
+	// ModelGroups defines named groups of models with priority tiers.
+	// Clients may request a group name as the model identifier; the proxy resolves
+	// it to the highest-priority available model, falling back to lower tiers on quota
+	// exhaustion (see model group failover in the handler layer).
+	ModelGroups []ModelGroup `yaml:"model-groups,omitempty" json:"model-groups,omitempty"`
+
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
@@ -205,6 +216,58 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+}
+
+// APIKeyConfig extends a client API key with optional per-key model restrictions
+// and load balancing overrides. Keys defined here are merged into the flat api-keys
+// list at load time so that MakeInlineAPIKeyProvider picks them up unchanged.
+type APIKeyConfig struct {
+	// Key is the client API key string, identical to an entry in the flat api-keys list.
+	Key string `yaml:"key" json:"key"`
+
+	// Label is an optional human-readable name shown in the management UI.
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
+
+	// AllowedModels restricts this key to specific model IDs. Requests for other
+	// models are rejected with 403. Empty slice means no restriction.
+	AllowedModels []string `yaml:"allowed-models,omitempty" json:"allowed-models,omitempty"`
+
+	// ModelGroup references a named ModelGroup by name. Clients may send the group
+	// name as the model identifier; the proxy resolves the highest-priority available
+	// model within the group, with automatic failover to lower priority tiers.
+	ModelGroup string `yaml:"model-group,omitempty" json:"model-group,omitempty"`
+
+	// Routing overrides the global routing strategy for requests authenticated with
+	// this key. Nil inherits the global routing config.
+	Routing *RoutingConfig `yaml:"routing,omitempty" json:"routing,omitempty"`
+
+	// Priority overrides the credential priority filter for requests authenticated
+	// with this key. When set, only credentials at or above this priority level are
+	// considered during selection. Nil means no restriction (all priorities allowed).
+	Priority *int `yaml:"priority,omitempty" json:"priority,omitempty"`
+}
+
+// ModelGroupEntry represents a single model within a ModelGroup with an associated priority.
+type ModelGroupEntry struct {
+	// Model is the model identifier (e.g. "claude-sonnet-4-20250514").
+	Model string `yaml:"model" json:"model"`
+
+	// Priority defines the failover tier. Higher values are preferred.
+	// Models sharing the same priority are load-balanced among each other.
+	// When all models at a tier exhaust quota, the next lower tier is tried.
+	Priority int `yaml:"priority" json:"priority"`
+}
+
+// ModelGroup is a named collection of models with priority-based failover.
+// Clients use the group Name as a virtual model identifier. The proxy resolves
+// it to the highest-priority available model in the group, falling back through
+// lower tiers when quota is exhausted.
+type ModelGroup struct {
+	// Name is the unique identifier for this group, used as the virtual model name.
+	Name string `yaml:"name" json:"name"`
+
+	// Models lists the group members with their priority tiers.
+	Models []ModelGroupEntry `yaml:"models" json:"models"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -668,6 +731,16 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
+	// Sanitize and deduplicate per-API-key config entries.
+	cfg.SanitizeAPIKeyConfigs()
+
+	// Sanitize and deduplicate model group definitions.
+	cfg.SanitizeModelGroups()
+
+	// Merge keys from APIKeyConfigs into the flat api-keys list so that
+	// MakeInlineAPIKeyProvider authenticates them without duplicate entries.
+	cfg.MergeAPIKeyConfigsIntoFlatList()
+
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
@@ -767,6 +840,148 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
+}
+
+// SanitizeAPIKeyConfigs trims whitespace from all string fields in APIKeyConfigs,
+// drops entries with blank keys, and removes blank entries from AllowedModels slices.
+func (cfg *Config) SanitizeAPIKeyConfigs() {
+	if cfg == nil || len(cfg.APIKeyConfigs) == 0 {
+		return
+	}
+	out := make([]APIKeyConfig, 0, len(cfg.APIKeyConfigs))
+	for _, kc := range cfg.APIKeyConfigs {
+		kc.Key = strings.TrimSpace(kc.Key)
+		if kc.Key == "" {
+			continue
+		}
+		kc.Label = strings.TrimSpace(kc.Label)
+		kc.ModelGroup = strings.TrimSpace(kc.ModelGroup)
+		if len(kc.AllowedModels) > 0 {
+			trimmed := make([]string, 0, len(kc.AllowedModels))
+			for _, m := range kc.AllowedModels {
+				m = strings.TrimSpace(m)
+				if m != "" {
+					trimmed = append(trimmed, m)
+				}
+			}
+			kc.AllowedModels = trimmed
+		}
+		out = append(out, kc)
+	}
+	cfg.APIKeyConfigs = out
+}
+
+// SanitizeModelGroups trims whitespace from all string fields in ModelGroups,
+// drops groups with blank names, and removes model entries with blank model names.
+// Groups that have no valid model entries after sanitization are also dropped.
+func (cfg *Config) SanitizeModelGroups() {
+	if cfg == nil || len(cfg.ModelGroups) == 0 {
+		return
+	}
+	out := make([]ModelGroup, 0, len(cfg.ModelGroups))
+	for _, g := range cfg.ModelGroups {
+		g.Name = strings.TrimSpace(g.Name)
+		if g.Name == "" {
+			continue
+		}
+		if len(g.Models) > 0 {
+			validModels := make([]ModelGroupEntry, 0, len(g.Models))
+			for _, me := range g.Models {
+				me.Model = strings.TrimSpace(me.Model)
+				if me.Model != "" {
+					validModels = append(validModels, me)
+				}
+			}
+			g.Models = validModels
+		}
+		if len(g.Models) == 0 {
+			continue
+		}
+		out = append(out, g)
+	}
+	cfg.ModelGroups = out
+}
+
+// MergeAPIKeyConfigsIntoFlatList ensures all keys from APIKeyConfigs also appear
+// in the flat SDKConfig.APIKeys slice. This allows MakeInlineAPIKeyProvider to
+// authenticate those keys without requiring duplicate entries in the config file.
+// Blank keys are skipped; existing keys are not duplicated.
+func (cfg *Config) MergeAPIKeyConfigsIntoFlatList() {
+	if cfg == nil || len(cfg.APIKeyConfigs) == 0 {
+		return
+	}
+	existing := make(map[string]struct{}, len(cfg.APIKeys))
+	for _, k := range cfg.APIKeys {
+		existing[k] = struct{}{}
+	}
+	for _, kc := range cfg.APIKeyConfigs {
+		key := strings.TrimSpace(kc.Key)
+		if key == "" {
+			continue
+		}
+		if _, dup := existing[key]; dup {
+			continue
+		}
+		cfg.APIKeys = append(cfg.APIKeys, key)
+		existing[key] = struct{}{}
+	}
+}
+
+// LookupAPIKeyConfig returns the APIKeyConfig for the given key string, or nil
+// if no config entry exists for that key. Linear scan; prefer BuildAPIKeyConfigIndex
+// when performing repeated lookups in a hot path.
+func (cfg *Config) LookupAPIKeyConfig(key string) *APIKeyConfig {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.APIKeyConfigs {
+		if cfg.APIKeyConfigs[i].Key == key {
+			return &cfg.APIKeyConfigs[i]
+		}
+	}
+	return nil
+}
+
+// LookupModelGroup returns the ModelGroup with the given name, or nil if not found.
+// Linear scan; prefer BuildModelGroupIndex for repeated lookups.
+func (cfg *Config) LookupModelGroup(name string) *ModelGroup {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.ModelGroups {
+		if cfg.ModelGroups[i].Name == name {
+			return &cfg.ModelGroups[i]
+		}
+	}
+	return nil
+}
+
+// BuildAPIKeyConfigIndex builds a map from API key string to *APIKeyConfig for O(1)
+// lookups. The returned map holds pointers into the Config's APIKeyConfigs slice;
+// callers must not modify the slice concurrently while using this map.
+func (cfg *Config) BuildAPIKeyConfigIndex() map[string]*APIKeyConfig {
+	if cfg == nil || len(cfg.APIKeyConfigs) == 0 {
+		return make(map[string]*APIKeyConfig)
+	}
+	m := make(map[string]*APIKeyConfig, len(cfg.APIKeyConfigs))
+	for i := range cfg.APIKeyConfigs {
+		m[cfg.APIKeyConfigs[i].Key] = &cfg.APIKeyConfigs[i]
+	}
+	return m
+}
+
+// BuildModelGroupIndex builds a map from group name to *ModelGroup for O(1) lookups.
+// The returned map holds pointers into the Config's ModelGroups slice; callers must
+// not modify the slice concurrently while using this map.
+func (cfg *Config) BuildModelGroupIndex() map[string]*ModelGroup {
+	if cfg == nil || len(cfg.ModelGroups) == 0 {
+		return make(map[string]*ModelGroup)
+	}
+	m := make(map[string]*ModelGroup, len(cfg.ModelGroups))
+	for i := range cfg.ModelGroups {
+		m[cfg.ModelGroups[i].Name] = &cfg.ModelGroups[i]
+	}
+	return m
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.

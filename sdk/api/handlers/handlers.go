@@ -16,8 +16,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/modelgroup"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -466,9 +468,325 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 	c.Set("API_RESPONSE", bytes.Clone(data))
 }
 
+// ginKeyConfigs extracts the per-key config and resolved model group from the Gin context
+// embedded in the request context by keyConfigMiddleware.
+func ginKeyConfigs(ctx context.Context) (*internalconfig.APIKeyConfig, *internalconfig.ModelGroup) {
+	if ctx == nil {
+		return nil, nil
+	}
+	ginCtx, _ := ctx.Value("gin").(*gin.Context)
+	if ginCtx == nil {
+		return nil, nil
+	}
+	var kc *internalconfig.APIKeyConfig
+	if raw, exists := ginCtx.Get("apiKeyConfig"); exists {
+		kc, _ = raw.(*internalconfig.APIKeyConfig)
+	}
+	var mg *internalconfig.ModelGroup
+	if raw, exists := ginCtx.Get("modelGroup"); exists {
+		mg, _ = raw.(*internalconfig.ModelGroup)
+	}
+	return kc, mg
+}
+
+/*
+isQuotaExhausted reports whether err represents a quota or rate-limit condition.
+Only quota errors trigger model-group tier fallback; all other errors surface immediately.
+*/
+func isQuotaExhausted(err error) bool {
+	if err == nil {
+		return false
+	}
+	if se, ok := err.(interface{ StatusCode() int }); ok {
+		code := se.StatusCode()
+		return code == http.StatusTooManyRequests || code == http.StatusPaymentRequired
+	}
+	return false
+}
+
+/*
+extractErrorMessage converts an execution error to an ErrorMessage.
+Headers are forwarded when the error carries them (e.g. upstream rate-limit headers).
+*/
+func extractErrorMessage(err error) *interfaces.ErrorMessage {
+	status := http.StatusInternalServerError
+	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		if code := se.StatusCode(); code > 0 {
+			status = code
+		}
+	}
+	var addon http.Header
+	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		if hdr := he.Headers(); hdr != nil {
+			addon = hdr.Clone()
+		}
+	}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+}
+
+/*
+executeWithModelGroup iterates model group tiers from highest to lowest priority,
+attempting each model until one succeeds. Within a tier all models are tried before
+falling to the next tier. Fallback across tiers only happens on quota errors (429/402);
+any other error aborts immediately.
+*/
+func (h *BaseAPIHandler) executeWithModelGroup(ctx context.Context, handlerType string, group *internalconfig.ModelGroup, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	tiers := modelgroup.GroupByPriority(group.Models)
+	var lastErr *interfaces.ErrorMessage
+
+	for _, tier := range tiers {
+		for _, model := range tier.Models {
+			providers, normalizedModel, errMsg := h.getRequestDetails(model)
+			if errMsg != nil {
+				lastErr = errMsg
+				continue
+			}
+			reqMeta := requestExecutionMetadata(ctx)
+			reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+			payload := rawJSON
+			if len(payload) == 0 {
+				payload = nil
+			}
+			req := coreexecutor.Request{Model: normalizedModel, Payload: payload}
+			opts := coreexecutor.Options{
+				Stream:          false,
+				Alt:             alt,
+				OriginalRequest: rawJSON,
+				SourceFormat:    sdktranslator.FromString(handlerType),
+				Metadata:        reqMeta,
+			}
+			resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
+			if err != nil {
+				em := extractErrorMessage(err)
+				if isQuotaExhausted(err) {
+					lastErr = em
+					continue
+				}
+				return nil, nil, em
+			}
+			if !PassthroughHeadersEnabled(h.Cfg) {
+				return resp.Payload, nil, nil
+			}
+			return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+		}
+	}
+
+	if lastErr != nil {
+		return nil, nil, lastErr
+	}
+	return nil, nil, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      fmt.Errorf("model group %q: all models exhausted", group.Name),
+	}
+}
+
+/*
+executeCountWithModelGroup mirrors executeWithModelGroup but calls ExecuteCount
+for token-counting requests.
+*/
+func (h *BaseAPIHandler) executeCountWithModelGroup(ctx context.Context, handlerType string, group *internalconfig.ModelGroup, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	tiers := modelgroup.GroupByPriority(group.Models)
+	var lastErr *interfaces.ErrorMessage
+
+	for _, tier := range tiers {
+		for _, model := range tier.Models {
+			providers, normalizedModel, errMsg := h.getRequestDetails(model)
+			if errMsg != nil {
+				lastErr = errMsg
+				continue
+			}
+			reqMeta := requestExecutionMetadata(ctx)
+			reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+			payload := rawJSON
+			if len(payload) == 0 {
+				payload = nil
+			}
+			req := coreexecutor.Request{Model: normalizedModel, Payload: payload}
+			opts := coreexecutor.Options{
+				Stream:          false,
+				Alt:             alt,
+				OriginalRequest: rawJSON,
+				SourceFormat:    sdktranslator.FromString(handlerType),
+				Metadata:        reqMeta,
+			}
+			resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
+			if err != nil {
+				em := extractErrorMessage(err)
+				if isQuotaExhausted(err) {
+					lastErr = em
+					continue
+				}
+				return nil, nil, em
+			}
+			if !PassthroughHeadersEnabled(h.Cfg) {
+				return resp.Payload, nil, nil
+			}
+			return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+		}
+	}
+
+	if lastErr != nil {
+		return nil, nil, lastErr
+	}
+	return nil, nil, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      fmt.Errorf("model group %q: all models exhausted", group.Name),
+	}
+}
+
+/*
+executeStreamWithModelGroup iterates model group tiers, attempting to open a stream
+for each model. Fallback to the next model occurs when a quota error (429/402) arrives
+before any payload bytes are sent. Once the first payload byte is received, the stream
+is piped to the caller and no further fallback can occur.
+*/
+func (h *BaseAPIHandler) executeStreamWithModelGroup(ctx context.Context, handlerType string, group *internalconfig.ModelGroup, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	dataChan := make(chan []byte)
+	errChan := make(chan *interfaces.ErrorMessage, 1)
+
+	go func() {
+		defer close(dataChan)
+		defer close(errChan)
+
+		sendErr := func(msg *interfaces.ErrorMessage) {
+			if ctx == nil {
+				errChan <- msg
+				return
+			}
+			select {
+			case <-ctx.Done():
+			case errChan <- msg:
+			}
+		}
+
+		sendData := func(chunk []byte) bool {
+			if ctx == nil {
+				dataChan <- chunk
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case dataChan <- chunk:
+				return true
+			}
+		}
+
+		tiers := modelgroup.GroupByPriority(group.Models)
+		var lastErr *interfaces.ErrorMessage
+
+		for _, tier := range tiers {
+			for _, model := range tier.Models {
+				providers, normalizedModel, errMsg := h.getRequestDetails(model)
+				if errMsg != nil {
+					lastErr = errMsg
+					continue
+				}
+				reqMeta := requestExecutionMetadata(ctx)
+				reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+				payload := rawJSON
+				if len(payload) == 0 {
+					payload = nil
+				}
+				req := coreexecutor.Request{Model: normalizedModel, Payload: payload}
+				opts := coreexecutor.Options{
+					Stream:          true,
+					Alt:             alt,
+					OriginalRequest: rawJSON,
+					SourceFormat:    sdktranslator.FromString(handlerType),
+					Metadata:        reqMeta,
+				}
+
+				streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+				if err != nil {
+					em := extractErrorMessage(err)
+					if isQuotaExhausted(err) {
+						lastErr = em
+						continue
+					}
+					sendErr(em)
+					return
+				}
+
+				// Read the first chunk to detect an early quota failure before committing to this model.
+				var firstChunk coreexecutor.StreamChunk
+				var open bool
+				if ctx != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case firstChunk, open = <-streamResult.Chunks:
+					}
+				} else {
+					firstChunk, open = <-streamResult.Chunks
+				}
+
+				if !open {
+					// Stream closed with no chunks — treat as transient and try the next model.
+					lastErr = &interfaces.ErrorMessage{
+						StatusCode: http.StatusBadGateway,
+						Error:      fmt.Errorf("model %s: stream closed without response", model),
+					}
+					continue
+				}
+
+				if firstChunk.Err != nil {
+					em := extractErrorMessage(firstChunk.Err)
+					if isQuotaExhausted(firstChunk.Err) {
+						lastErr = em
+						continue
+					}
+					sendErr(em)
+					return
+				}
+
+				// First payload received — send it and pipe the rest; no more fallback.
+				if len(firstChunk.Payload) > 0 {
+					if !sendData(cloneBytes(firstChunk.Payload)) {
+						return
+					}
+				}
+				for chunk := range streamResult.Chunks {
+					if chunk.Err != nil {
+						sendErr(extractErrorMessage(chunk.Err))
+						return
+					}
+					if len(chunk.Payload) > 0 {
+						if !sendData(cloneBytes(chunk.Payload)) {
+							return
+						}
+					}
+				}
+				return
+			}
+		}
+
+		if lastErr != nil {
+			sendErr(lastErr)
+			return
+		}
+		sendErr(&interfaces.ErrorMessage{
+			StatusCode: http.StatusTooManyRequests,
+			Error:      fmt.Errorf("model group %q: all models exhausted", group.Name),
+		})
+	}()
+
+	return dataChan, nil, errChan
+}
+
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	keyConfig, modelGroupCfg := ginKeyConfigs(ctx)
+
+	if err := modelgroup.CheckModelAccess(keyConfig, modelName); err != nil {
+		return nil, nil, extractErrorMessage(err)
+	}
+
+	if modelgroup.IsGroupModel(modelName, modelGroupCfg) {
+		return h.executeWithModelGroup(ctx, handlerType, modelGroupCfg, rawJSON, alt)
+	}
+
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
@@ -515,6 +833,16 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	keyConfig, modelGroupCfg := ginKeyConfigs(ctx)
+
+	if err := modelgroup.CheckModelAccess(keyConfig, modelName); err != nil {
+		return nil, nil, extractErrorMessage(err)
+	}
+
+	if modelgroup.IsGroupModel(modelName, modelGroupCfg) {
+		return h.executeCountWithModelGroup(ctx, handlerType, modelGroupCfg, rawJSON, alt)
+	}
+
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
@@ -562,6 +890,19 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	keyConfig, modelGroupCfg := ginKeyConfigs(ctx)
+
+	if err := modelgroup.CheckModelAccess(keyConfig, modelName); err != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- extractErrorMessage(err)
+		close(errChan)
+		return nil, nil, errChan
+	}
+
+	if modelgroup.IsGroupModel(modelName, modelGroupCfg) {
+		return h.executeStreamWithModelGroup(ctx, handlerType, modelGroupCfg, rawJSON, alt)
+	}
+
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)

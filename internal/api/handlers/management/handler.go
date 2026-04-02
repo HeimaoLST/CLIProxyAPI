@@ -48,6 +48,12 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	/*
+	 * keyConfigRefreshFunc is called whenever api-key-configs or model-groups change
+	 * so the server can immediately rebuild its in-memory lookup indexes.
+	 * It is optional; when nil the change takes effect after the next file-watcher reload.
+	 */
+	keyConfigRefreshFunc func()
 }
 
 // NewHandler creates a new management handler instance.
@@ -132,6 +138,13 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetKeyConfigRefreshFunc registers an optional callback invoked after api-key-configs or
+// model-groups are modified via the management API, allowing the server to immediately
+// rebuild its in-memory lookup indexes.
+func (h *Handler) SetKeyConfigRefreshFunc(f func()) {
+	h.keyConfigRefreshFunc = f
 }
 
 // Middleware enforces access control for management endpoints.

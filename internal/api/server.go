@@ -171,6 +171,15 @@ type Server struct {
 
 	localPassword string
 
+	// apiKeyConfigIndex is an atomically swapped lookup map from API key string to
+	// *config.APIKeyConfig. It is rebuilt on startup and on every config hot-reload.
+	// Using atomic.Value lets the auth middleware read it lock-free on the hot path.
+	apiKeyConfigIndex atomic.Value // stores map[string]*config.APIKeyConfig
+
+	// modelGroupIndex is an atomically swapped lookup map from group name to
+	// *config.ModelGroup. Rebuilt alongside apiKeyConfigIndex.
+	modelGroupIndex atomic.Value // stores map[string]*config.ModelGroup
+
 	keepAliveEnabled   bool
 	keepAliveTimeout   time.Duration
 	keepAliveOnTimeout func()
@@ -256,6 +265,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 	s.applyAccessConfig(nil, cfg)
+	s.rebuildKeyConfigIndexes(cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
@@ -263,6 +273,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetKeyConfigRefreshFunc(func() { s.rebuildKeyConfigIndexes(s.cfg) })
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -327,6 +338,7 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(s.keyConfigMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -341,6 +353,7 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(s.keyConfigMiddleware())
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -533,6 +546,16 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+
+		mgmt.GET("/api-key-configs", s.mgmt.GetAPIKeyConfigs)
+		mgmt.PUT("/api-key-configs", s.mgmt.PutAPIKeyConfigs)
+		mgmt.PATCH("/api-key-configs", s.mgmt.PatchAPIKeyConfig)
+		mgmt.DELETE("/api-key-configs", s.mgmt.DeleteAPIKeyConfig)
+
+		mgmt.GET("/model-groups", s.mgmt.GetModelGroups)
+		mgmt.PUT("/model-groups", s.mgmt.PutModelGroups)
+		mgmt.PATCH("/model-groups", s.mgmt.PatchModelGroup)
+		mgmt.DELETE("/model-groups", s.mgmt.DeleteModelGroup)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
@@ -859,6 +882,17 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// rebuildKeyConfigIndexes rebuilds the apiKeyConfigIndex and modelGroupIndex from cfg.
+// It is called on startup and on every config hot-reload so that the middleware always
+// uses up-to-date per-key policy without holding a lock during request handling.
+func (s *Server) rebuildKeyConfigIndexes(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	s.apiKeyConfigIndex.Store(cfg.BuildAPIKeyConfigIndex())
+	s.modelGroupIndex.Store(cfg.BuildModelGroupIndex())
+}
+
 func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
 	if s == nil || s.accessManager == nil || newCfg == nil {
 		return
@@ -956,6 +990,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	s.applyAccessConfig(oldCfg, cfg)
+	s.rebuildKeyConfigIndexes(cfg)
 	s.cfg = cfg
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
@@ -1021,6 +1056,47 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 }
 
 // (management handlers moved to internal/api/handlers/management)
+
+// keyConfigMiddleware returns a Gin middleware that injects the *config.APIKeyConfig
+// and *config.ModelGroup (when the key is assigned a group) into the Gin context
+// after authentication. It reads atomically swapped lookup maps so it is lock-free
+// on the hot path.
+//
+// Context keys set by this middleware:
+//   - "apiKeyConfig"  → *config.APIKeyConfig (nil when key has no extended config)
+//   - "modelGroup"    → *config.ModelGroup   (nil when key has no model group)
+func (s *Server) keyConfigMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		apiKeyRaw, exists := c.Get("apiKey")
+		if !exists {
+			c.Next()
+			return
+		}
+		apiKey, _ := apiKeyRaw.(string)
+		if apiKey == "" {
+			c.Next()
+			return
+		}
+
+		if raw := s.apiKeyConfigIndex.Load(); raw != nil {
+			if idx, ok := raw.(map[string]*config.APIKeyConfig); ok {
+				if kc, found := idx[apiKey]; found {
+					c.Set("apiKeyConfig", kc)
+					if kc.ModelGroup != "" {
+						if groupRaw := s.modelGroupIndex.Load(); groupRaw != nil {
+							if gidx, ok2 := groupRaw.(map[string]*config.ModelGroup); ok2 {
+								if mg, found2 := gidx[kc.ModelGroup]; found2 {
+									c.Set("modelGroup", mg)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		c.Next()
+	}
+}
 
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
 // using the configured authentication providers. When no providers are available,

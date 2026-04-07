@@ -164,10 +164,22 @@ func TestIsQuotaExhausted_PaymentRequired(t *testing.T) {
 	}
 }
 
+func TestIsQuotaExhausted_Unauthorized(t *testing.T) {
+	if !isQuotaExhausted(&statusErr{http.StatusUnauthorized}) {
+		t.Error("expected 401 (upstream credentials invalid) to trigger fallover")
+	}
+}
+
+func TestIsQuotaExhausted_Forbidden(t *testing.T) {
+	if !isQuotaExhausted(&statusErr{http.StatusForbidden}) {
+		t.Error("expected 403 (upstream credentials lack access) to trigger fallover")
+	}
+}
+
 func TestIsQuotaExhausted_OtherStatus(t *testing.T) {
-	for _, code := range []int{400, 401, 403, 500, 502} {
+	for _, code := range []int{400, 500, 502} {
 		if isQuotaExhausted(&statusErr{code}) {
-			t.Errorf("expected %d NOT to be quota-exhausted", code)
+			t.Errorf("expected %d NOT to trigger fallover", code)
 		}
 	}
 }

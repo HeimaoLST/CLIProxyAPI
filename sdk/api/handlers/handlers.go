@@ -490,16 +490,27 @@ func ginKeyConfigs(ctx context.Context) (*internalconfig.APIKeyConfig, *internal
 }
 
 /*
-isQuotaExhausted reports whether err represents a quota or rate-limit condition.
-Only quota errors trigger model-group tier fallback; all other errors surface immediately.
+isQuotaExhausted reports whether err should trigger model-group tier fallback.
+Returns true for quota/auth errors where switching to the next model tier may succeed;
+returns false for errors that should surface immediately (bad request, server error, etc).
 */
 func isQuotaExhausted(err error) bool {
 	if err == nil {
 		return false
 	}
 	if se, ok := err.(interface{ StatusCode() int }); ok {
-		code := se.StatusCode()
-		return code == http.StatusTooManyRequests || code == http.StatusPaymentRequired
+		switch se.StatusCode() {
+		case http.StatusTooManyRequests, // 429: quota exhausted
+			http.StatusPaymentRequired,  // 402: subscription limit
+			http.StatusUnauthorized,     // 401: upstream credentials invalid/expired
+			http.StatusForbidden:        // 403: upstream credentials lack access
+			return true
+		}
+	}
+	// Auth pool exhaustion: all accounts for this model are unavailable.
+	// Treat as fallover signal so group routing continues to the next tier.
+	if authErr, ok := err.(*coreauth.Error); ok && authErr != nil {
+		return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
 	}
 	return false
 }

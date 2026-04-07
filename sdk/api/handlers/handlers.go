@@ -500,10 +500,14 @@ func isQuotaExhausted(err error) bool {
 	}
 	if se, ok := err.(interface{ StatusCode() int }); ok {
 		switch se.StatusCode() {
-		case http.StatusTooManyRequests, // 429: quota exhausted
-			http.StatusPaymentRequired,  // 402: subscription limit
-			http.StatusUnauthorized,     // 401: upstream credentials invalid/expired
-			http.StatusForbidden:        // 403: upstream credentials lack access
+		case http.StatusTooManyRequests,    // 429: quota exhausted
+			http.StatusPaymentRequired,     // 402: subscription limit
+			http.StatusUnauthorized,        // 401: upstream credentials invalid/expired
+			http.StatusForbidden,           // 403: upstream credentials lack access
+			http.StatusInternalServerError, // 500: upstream transient error
+			http.StatusBadGateway,          // 502: upstream unreachable
+			http.StatusServiceUnavailable,  // 503: upstream overloaded
+			http.StatusGatewayTimeout:      // 504: upstream timeout
 			return true
 		}
 	}

@@ -176,11 +176,18 @@ func TestIsQuotaExhausted_Forbidden(t *testing.T) {
 	}
 }
 
-func TestIsQuotaExhausted_OtherStatus(t *testing.T) {
-	for _, code := range []int{400, 500, 502} {
-		if isQuotaExhausted(&statusErr{code}) {
-			t.Errorf("expected %d NOT to trigger fallover", code)
+func TestIsQuotaExhausted_ServerErrors(t *testing.T) {
+	for _, code := range []int{500, 502, 503, 504} {
+		if !isQuotaExhausted(&statusErr{code}) {
+			t.Errorf("expected %d (upstream transient error) to trigger fallover", code)
 		}
+	}
+}
+
+func TestIsQuotaExhausted_BadRequest(t *testing.T) {
+	// 400 must NOT trigger fallover: request is malformed, switching model won't help.
+	if isQuotaExhausted(&statusErr{http.StatusBadRequest}) {
+		t.Error("expected 400 NOT to trigger fallover")
 	}
 }
 

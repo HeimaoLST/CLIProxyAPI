@@ -19,8 +19,6 @@ A self-hosted LLM proxy that:
 ### Minimum viable start
 
 ```bash
-mkdir -p auths
-
 docker run -d \
   --name cliproxyapi \
   -p 8317:8317 \
@@ -31,7 +29,7 @@ docker run -d \
 ```
 
 - `MANAGEMENT_PASSWORD` enables the management API with remote access — no config file needed to start
-- If `config.yaml` is empty or missing, the container seeds it from the built-in template on first start
+- On first start the container creates missing directories and seeds `config.yaml` from the built-in template if it is empty
 - `config.yaml` is written by the management API when settings are saved; mount it for persistence
 - `auths/` holds provider credential files (Claude OAuth tokens, etc.)
 

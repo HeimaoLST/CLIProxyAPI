@@ -11,6 +11,8 @@ A self-hosted proxy server providing OpenAI / Gemini / Claude compatible API end
 ### One-liner
 
 ```bash
+mkdir -p auths
+
 docker run -d \
   -p 8317:8317 \
   -e MANAGEMENT_PASSWORD=your-secret \
@@ -20,17 +22,13 @@ docker run -d \
   ghcr.io/minervacap2022/cliproxyapi:latest
 ```
 
-Pre-create the volume files before starting:
-
-```bash
-touch config.yaml && mkdir -p auths
-```
+If `config.yaml` is empty or missing, the container automatically seeds it from the built-in template on first start.
 
 ### Docker Compose
 
 ```bash
 # 1. Create data directories
-touch config.yaml && mkdir -p auths logs
+mkdir -p auths logs
 
 # 2. Set your management password and start
 MANAGEMENT_PASSWORD=your-secret docker compose up -d

@@ -78,13 +78,17 @@ func IsGroupModel(name string, group *config.ModelGroup) bool {
 //
 // Access rules:
 //   - nil keyConfig → allow all (backward compatible, key has no extended config)
+//   - AllowOtherModels true → allow all (explicit opt-in)
 //   - empty AllowedModels + no ModelGroup → allow all
-//   - non-empty AllowedModels → model must be in the list
-//   - ModelGroup set → group name itself is also an allowed "model" identifier
-//   - both AllowedModels and ModelGroup set → model must be in AllowedModels or equal to ModelGroup name
-//   - only ModelGroup set (no AllowedModels) → only the group name is allowed
+//   - only ModelGroup set → only the group name is allowed
+//   - only ModelGroup set + AllowOtherModels → allow all (flag overrides restriction)
 func CheckModelAccess(keyConfig *config.APIKeyConfig, model string) error {
 	if keyConfig == nil {
+		return nil
+	}
+
+	// Explicit opt-in: key may use any model.
+	if keyConfig.AllowOtherModels {
 		return nil
 	}
 

@@ -237,6 +237,11 @@ type APIKeyConfig struct {
 	// model within the group, with automatic failover to lower priority tiers.
 	ModelGroup string `yaml:"model-group,omitempty" json:"model-group,omitempty"`
 
+	// AllowOtherModels, when true, allows this key to request any model directly
+	// in addition to the configured ModelGroup. When false (default), only the
+	// group name is accepted as a model identifier.
+	AllowOtherModels bool `yaml:"allow-other-models,omitempty" json:"allow-other-models,omitempty"`
+
 	// Routing overrides the global routing strategy for requests authenticated with
 	// this key. Nil inherits the global routing config.
 	Routing *RoutingConfig `yaml:"routing,omitempty" json:"routing,omitempty"`

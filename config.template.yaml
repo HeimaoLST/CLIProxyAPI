@@ -8,6 +8,8 @@ remote-management:
   allow-remote: true
   # Set a plaintext secret; it will be bcrypt-hashed automatically on first start
   secret-key: "change-me-to-a-strong-secret"
+  # The panel is bundled in the Docker image — disable auto-download from GitHub
+  disable-auto-update-panel: true
 
 # Auth directory inside the container (matches docker-compose volume mount)
 auth-dir: "/root/.cli-proxy-api"

@@ -1,0 +1,31 @@
+# CLIProxyAPI — minimal deployment config
+# Copy this file to config.yaml and fill in your settings.
+
+port: 8317
+
+remote-management:
+  # Allow managing from outside localhost (required for web panel)
+  allow-remote: true
+  # Set a plaintext secret; it will be bcrypt-hashed automatically on first start
+  secret-key: "change-me-to-a-strong-secret"
+
+# Auth directory inside the container (matches docker-compose volume mount)
+auth-dir: "/root/.cli-proxy-api"
+
+# Client API keys — callers must send one of these as their Bearer token
+api-keys:
+  - "your-client-api-key"
+
+# ── Optional: model groups for priority failover ────────────────────────────
+# api-key-configs:
+#   - key: "your-client-api-key"
+#     label: "My Agent"
+#     model-group: "auto"
+#
+# model-groups:
+#   - name: auto
+#     models:
+#       - model: claude-sonnet-4-6
+#         priority: 2
+#       - model: doubao-pro-32k
+#         priority: 1
